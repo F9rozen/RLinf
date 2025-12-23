@@ -91,19 +91,25 @@ rollout:
 env:
   group_name: "env_group"
   train:
-    simulator_type: "your_marl_env"  # 需要替换为实际的多智能体环境类型
+    simulator_type: "simple_marl"  # 使用simple_marl环境（示例环境）
     total_num_envs: 64
     max_steps_per_rollout_epoch: 100
     auto_reset: true
     ignore_terminations: false
     enable_offload: false
+    seed: 42
+    grid_size: 10        # 网格大小（simple_marl环境参数）
+    max_steps: 100       # 最大步数（simple_marl环境参数）
     
   eval:
-    simulator_type: "your_marl_env"
+    simulator_type: "simple_marl"  # 使用simple_marl环境（示例环境）
     total_num_envs: 16
     max_steps_per_rollout_epoch: 100
     auto_reset: false
     enable_offload: false
+    seed: 42
+    grid_size: 10
+    max_steps: 100
     
   channel:
     name: "env_channel"

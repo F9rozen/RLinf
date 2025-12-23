@@ -24,10 +24,14 @@ MARL框架支持多种多智能体强化学习算法和训练范式：
 ```
 examples/marl/
 ├── README.md                    # 本文档
+├── QUICKSTART.md               # 快速开始指南
+├── ENV_SETUP.md                # 环境准备详细指南
+├── ENV_QUICK_REFERENCE.md      # 环境准备快速参考
+├── SETUP_COMPLETE.md           # 配置完成说明
 ├── config/                      # 配置文件目录
-│   ├── mappo_example.yaml      # MAPPO配置示例
-│   └── ippo_example.yaml       # IPPO配置示例
+│   └── mappo_example.yaml      # MAPPO配置示例
 ├── main_marl.py                # MARL训练主程序
+├── env_example.py              # 环境实现示例
 └── run_marl.sh                 # 运行脚本
 ```
 
@@ -49,7 +53,12 @@ marl:
     method: "message_passing"      # 通信方法
 ```
 
-### 2. 环境适配
+### 2. 环境准备
+
+**重要**: 在开始训练前，必须先准备多智能体环境。详细指南请参考：
+- [环境准备详细指南](ENV_SETUP.md)
+- [环境准备快速参考](ENV_QUICK_REFERENCE.md)
+- [环境实现示例](env_example.py)
 
 多智能体环境需要返回字典格式的观察、奖励和done标志：
 
