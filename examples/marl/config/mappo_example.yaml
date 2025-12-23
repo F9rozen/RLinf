@@ -1,0 +1,146 @@
+# MAPPO (Multi-Agent PPO) 配置示例
+# 这是一个多智能体强化学习的配置示例，展示了如何使用MAPPO算法进行训练
+
+# 基础配置
+data:
+  rollout_batch_size: 32
+  max_prompt_length: 512
+
+# 算法配置
+algorithm:
+  name: "mappo"
+  advantage_type: "mappo"          # 使用MAPPO优势计算
+  n_minibatches: 4
+  group_size: 1
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  
+  # PPO参数
+  ratio_clip_eps: 0.2
+  value_loss_coef: 0.5
+  entropy_bonus: 0.01
+  kl_beta: 0.0
+  kl_penalty_type: ""
+  
+  # 优势计算参数
+  gamma: 0.99
+  gae_lambda: 0.95
+  normalize_advantages: true
+  normalize_returns: false
+  
+  # 损失聚合函数
+  loss_agg_func: "seq-mean-token-mean"
+  calculate_entropy: true
+
+# MARL特定配置
+marl:
+  num_agents: 2                    # 智能体数量
+  agent_ids: ["agent_0", "agent_1"]  # 智能体ID
+  algorithm: "mappo"               # MARL算法类型
+  policy_sharing: "independent"    # 策略共享方式: independent, shared, partial
+  
+  # CTDE配置
+  use_global_state: true           # 是否使用全局状态
+  centralized_critic: true         # 是否使用集中式critic
+  use_global_done: true             # 是否使用全局done标志
+  
+  # 通信配置（可选）
+  communication:
+    enabled: false
+    method: "message_passing"
+    message_dim: 64
+
+# Actor配置（每个智能体可以有不同的配置）
+actor:
+  group_name: "actor_group"
+  training_backend: "fsdp"         # fsdp 或 megatron
+  model:
+    model_type: "mlp_policy"       # 或其他支持的模型类型
+    model_path: "/path/to/pretrained_model"  # 初始模型路径
+    hidden_dim: 256
+    num_layers: 2
+    action_dim: 8                  # 动作维度
+    obs_dim: 24                    # 观察维度
+    num_action_chunks: 1
+    
+  # 训练配置
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  offload_optimizer: false
+  offload_weight: false
+  offload_grad: false
+  
+  channel:
+    name: "actor_channel"
+    queue_name: "actor_queue"
+
+# Rollout配置
+rollout:
+  group_name: "rollout_group"
+  model:
+    model_path: "/path/to/pretrained_model"  # 与actor相同或不同的模型
+    precision: "bf16"
+  channel:
+    name: "rollout_channel"
+    queue_name: "rollout_queue"
+  pipeline_stage_num: 2
+  enable_offload: false
+
+# 环境配置
+env:
+  group_name: "env_group"
+  train:
+    simulator_type: "your_marl_env"  # 需要替换为实际的多智能体环境类型
+    total_num_envs: 64
+    max_steps_per_rollout_epoch: 100
+    auto_reset: true
+    ignore_terminations: false
+    enable_offload: false
+    
+  eval:
+    simulator_type: "your_marl_env"
+    total_num_envs: 16
+    max_steps_per_rollout_epoch: 100
+    auto_reset: false
+    enable_offload: false
+    
+  channel:
+    name: "env_channel"
+    queue_name: "env_queue"
+  enable_offload: false
+
+# Runner配置
+runner:
+  max_epochs: 1000
+  max_steps: -1
+  val_check_interval: 50
+  save_interval: 100
+  logger:
+    log_path: "./logs"
+    experiment_name: "mappo_experiment"
+
+# Cluster配置
+cluster:
+  num_nodes: 1
+  accelerator_type: "cuda"
+  
+# Placement配置
+placement:
+  mode: "hybrid"                    # hybrid, model_parallel, data_parallel
+  actor:
+    num_workers: 2                  # 每个智能体一个worker（独立策略）或1个（共享策略）
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+  rollout:
+    num_workers: 2
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+  env:
+    num_workers: 1
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+
