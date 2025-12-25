@@ -25,18 +25,19 @@ runner:
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1
-  max_steps: -1
+  max_steps: 200
 
   val_check_interval: 25
   save_interval: 25
 
   seq_length: 7096
 
-  enable_dynamic_batch_size: False
-  max_tokens_per_mbs: 7096
+  enable_dynamic_batch_size: True
+  max_tokens_per_mbs: 11008
+  max_tokens_per_mbs_inference: 11008
 
   resume_dir: null
-  experiment_name: searchr1-grpo-qwen2.5-3b-ins
+  experiment_name: 12-24-searchr1-qdrant5
   output_dir: ../results
 
 algorithm:
@@ -48,7 +49,7 @@ algorithm:
   # mbs to do log prob inference, can be set to
   # lower than rollout_batch_size_per_gpu to reduce
   # memory usage
-  logprob_forward_micro_batch_size: 1 # ${.rollout_batch_size_per_gpu}
+  logprob_forward_micro_batch_size: 16 # ${.rollout_batch_size_per_gpu}
 
   # val rollout mbs
   val_rollout_batch_size_per_gpu: 1 # ${.rollout_batch_size_per_gpu}
@@ -75,7 +76,7 @@ algorithm:
 
   # params for rollout
   sampling_params:
-    do_sample: True
+    do_sample: False
     temperature: 1.0
     top_k: 1000000
     top_p: 1.0
@@ -105,7 +106,7 @@ rollout:
 
   gpu_memory_utilization: 0.75
   model:
-    model_path: /path/to/model/Qwen2.5-3B-Instruct
+    model_path: path/to/Qwen2.5-3B-Instruct-search
     model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
@@ -141,7 +142,7 @@ rollout:
   validate_save_dir: null # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
   print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
 
-  max_running_requests: 32 # the maximum number of running requests in the rollout engine.
+  max_running_requests: 128 # the maximum number of running requests in the rollout engine.
   cuda_graph_max_bs: 128 # the maximum batch size for cuda graph. If the batch size is larger than this, cuda graph will not be used.
   is_eval: False
 
@@ -158,8 +159,8 @@ data:
   shuffle: True
   validation_shuffle: True
   seed: 1234
-  train_data_paths: ["/path/to/data/searchr1_train.jsonl"]
-  val_data_paths: ["/path/to/data/searchr1_train.jsonl"]
+  train_data_paths: ["path/to/searchr1_train.jsonl"]
+  val_data_paths: ["path/to/searchr1_train.jsonl"]
 
 # Tools configuration for AgentLoop
 tools:
@@ -197,7 +198,7 @@ actor:
 
     recompute_method: block
     recompute_granularity: full
-    recompute_num_layers: 20
+    recompute_num_layers: 36
 
     seq_length: ${runner.seq_length}
     encoder_seq_length: ${runner.seq_length}
