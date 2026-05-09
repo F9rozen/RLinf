@@ -29,6 +29,7 @@ from gymnasium.vector.utils import (
     concatenate,
     create_empty_array,
     create_shared_memory,
+    iterate,
     read_from_shared_memory,
     write_to_shared_memory,
 )
@@ -42,31 +43,48 @@ class NoAutoResetSyncVectorEnv(SyncVectorEnv):
     ) -> tuple[Any, NDArray[Any], NDArray[Any], NDArray[Any], dict]:
         """Steps through each of the environments returning the batched results.
 
-        Returns:
-            The batched environment step results
+        Does not auto-reset when an env terminates (same behavior as older RLinf).
+
+        Gymnasium 1.x renamed ``_terminateds``/``_truncateds`` to ``_terminations``/
+        ``_truncations`` and uses ``_observations`` for the write buffer; support both.
         """
+        if hasattr(self, "_terminations"):
+            actions = iterate(self.action_space, actions)
         self._actions = actions
         observations, infos = [], {}
+        if hasattr(self, "_terminations"):
+            terms, truncs = self._terminations, self._truncations
+            obs_buf = self._observations
+        else:
+            terms, truncs = self._terminateds, self._truncateds
+            obs_buf = self.observations
         for i, (env, action) in enumerate(zip(self.envs, self._actions)):
             (
                 observation,
                 self._rewards[i],
-                self._terminateds[i],
-                self._truncateds[i],
+                terms[i],
+                truncs[i],
                 info,
             ) = env.step(action)
 
             observations.append(observation)
             infos = self._add_info(infos, info, i)
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
+        new_obs = concatenate(
+            self.single_observation_space, observations, obs_buf
+        )
+        if hasattr(self, "_observations"):
+            self._observations = new_obs
+        else:
+            self.observations = new_obs
+        obs_out = (
+            self._observations if hasattr(self, "_observations") else self.observations
         )
 
         return (
-            deepcopy(self.observations) if self.copy else self.observations,
+            deepcopy(obs_out) if self.copy else obs_out,
             np.copy(self._rewards),
-            np.copy(self._terminateds),
-            np.copy(self._truncateds),
+            np.copy(terms),
+            np.copy(truncs),
             infos,
         )
 

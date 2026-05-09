@@ -294,10 +294,19 @@ class GimArmController(Worker):
             reset_qpos: Target joint positions ``(6,)`` in radians.
             duration: Time in seconds for the interpolation.
         """
-        reading = self._sdk.get_reading()
+        reading = None
+        for _ in range(50):
+            reading = self._sdk.get_reading()
+            if reading is not None:
+                break
+            time.sleep(0.1)
         if reading is None:
-            self._logger.warning("reset_joint: no reading available, skipping.")
-            return
+            msg = (
+                "reset_joint: no encoder reading after 5.0s of retries; "
+                "cannot move to reset pose. Check CAN / arm power / SDK."
+            )
+            self._logger.error(msg)
+            raise RuntimeError(msg)
 
         start_q = np.array(reading.position, dtype=np.float64)
         target_q = np.array(reset_qpos, dtype=np.float64)

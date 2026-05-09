@@ -44,21 +44,6 @@ class DreamZeroConfig(VLAConfig):
     action_dim: int = field(default=None, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
 
-    env_action_dim: int = field(
-        default=None, metadata={"help": "Environment action dimension."}
-    )
-    num_action_chunks: int = field(
-        default=16, metadata={"help": "Number of action chunks."}
-    )
-
-    relative_action: bool = field(default=False, metadata={"help": "Relative action."})
-    relative_action_per_horizon: bool = field(
-        default=False, metadata={"help": "Relative action per horizon."}
-    )
-    relative_action_keys: list = field(
-        default_factory=list, metadata={"help": "Relative action keys."}
-    )
-
     data_transforms: ComposedModalityTransform = field(
         default=None,
         metadata={
@@ -204,10 +189,87 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 normalized_input[k] = v.to(dtype=target_dtype)
         return normalized_input
 
+    def _cv2_resize_wh_from_transforms(self) -> tuple[int, int]:
+        """Return ``(width, height)`` for ``cv2.resize(..., dsize)``, matching groot exactly.
+
+        ``VideoToTensor`` stores ``original_resolutions`` from dataset metadata as **(width, height)**.
+        It validates ``data[key].shape[-3:-1][::-1]`` against that tuple, so metadata JSON must list
+        ``[W, H]`` — e.g. physical **176×320** (rows×cols) needs ``[320, 176]``, not ``[176, 320]``.
+
+        RealWorld envs often emit 128×128 or 256×256; resizing here avoids VideoToTensor shape errors.
+        """
+        log = get_logger()
+        composed = self.config.data_transforms
+        if composed is None:
+            log.warning(
+                "[DreamZeroPolicy] _cv2_resize_wh: data_transforms is None; "
+                "fallback cv2 dsize (width,height)=(256,256)"
+            )
+            return (256, 256)
+        for idx, t in enumerate(getattr(composed, "transforms", []) or []):
+            try:
+                orig = getattr(t, "original_resolutions", None)
+                if isinstance(orig, dict) and "video.image" in orig:
+                    w_g, h_g = orig["video.image"]
+                    w_g, h_g = int(w_g), int(h_g)
+                    log.info(
+                        "[DreamZeroPolicy] _cv2_resize_wh: from transforms[%s] %s "
+                        "original_resolutions['video.image']=%s (width,height per groot) -> "
+                        "cv2 dsize (width,height)=(%s,%s); numpy (H,W)=(%s,%s)",
+                        idx,
+                        type(t).__name__,
+                        orig["video.image"],
+                        w_g,
+                        h_g,
+                        h_g,
+                        w_g,
+                    )
+                    return (w_g, h_g)
+                if isinstance(orig, dict) and "video.wrist_image" in orig:
+                    w_g, h_g = orig["video.wrist_image"]
+                    w_g, h_g = int(w_g), int(h_g)
+                    log.info(
+                        "[DreamZeroPolicy] _cv2_resize_wh: from transforms[%s] %s "
+                        "original_resolutions['video.wrist_image']=%s (width,height per groot) -> "
+                        "cv2 dsize (width,height)=(%s,%s); numpy (H,W)=(%s,%s)",
+                        idx,
+                        type(t).__name__,
+                        orig["video.wrist_image"],
+                        w_g,
+                        h_g,
+                        h_g,
+                        w_g,
+                    )
+                    return (w_g, h_g)
+            except Exception as e:
+                log.debug(
+                    "[DreamZeroPolicy] _cv2_resize_wh: transform[%s] %s skipped: %s",
+                    idx,
+                    type(t).__name__,
+                    e,
+                )
+                continue
+        log.warning(
+            "[DreamZeroPolicy] _cv2_resize_wh: no usable original_resolutions "
+            "for video.image / video.wrist_image; fallback cv2 dsize (256,256)"
+        )
+        return (256, 256)
+
     def _observation_convert(self, env_obs: dict) -> dict:
         """Convert environment observation to model input for end-effector control"""
         main = env_obs["main_images"]
         wrist = env_obs.get("wrist_images", None)
+        if wrist is None and env_obs.get("extra_view_images", None) is not None:
+            ev = env_obs["extra_view_images"]
+            if torch.is_tensor(ev):
+                ev = ev.detach().cpu().numpy()
+            else:
+                ev = np.asarray(ev)
+            # RealWorldEnv stacks non-main cameras as [B, K, H, W, C]
+            if ev.ndim == 5:
+                wrist = ev[:, 0]
+            elif ev.ndim == 4:
+                wrist = ev
         states = env_obs.get("states", None)
         prompts = env_obs.get("task_descriptions", None)
         if torch.is_tensor(main):
@@ -221,20 +283,35 @@ class DreamZeroPolicy(VLA, BasePolicy):
             else:
                 wrist = np.asarray(wrist)
 
-        def _resize_bt_hwc_uint8(x, h=256, w=256):
-            # x: [B,H,W,C
+        cw, ch = self._cv2_resize_wh_from_transforms()
+
+        log = get_logger()
+        log.info(
+            "[DreamZeroPolicy]======== _observation_convert: cv2 resize "
+            "dsize (width,height)=(%s,%s); target numpy (H,W)=(%s,%s)",
+            cw,
+            ch,
+            ch,
+            cw,
+        )
+
+        def _resize_bt_hwc_uint8(x: np.ndarray) -> np.ndarray:
+            # x: [B, H, W, C] uint8 -> resize to groot (width,height)=(cw,ch) => numpy [..., ch, cw, :]
             B = x.shape[0]
-            out = np.empty((B, h, w, 3), dtype=np.uint8)
+            out = np.empty((B, ch, cw, 3), dtype=np.uint8)
             for b in range(B):
                 frame = x[b]
                 if frame.dtype != np.uint8:
                     frame = frame.astype(np.uint8)
-                out[b] = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+                out[b] = cv2.resize(
+                    frame, (cw, ch), interpolation=cv2.INTER_AREA
+                )
             return out
 
         main = _resize_bt_hwc_uint8(main)
-        if wrist is not None:
-            wrist = _resize_bt_hwc_uint8(wrist)
+        if wrist is None:
+            wrist = np.copy(main)
+        wrist = _resize_bt_hwc_uint8(wrist)
         if main.ndim == 4:
             main = main[:, None, ...]
         if wrist is not None and wrist.ndim == 4:
@@ -256,9 +333,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
         if isinstance(prompts, str):
             prompts = [prompts] * B
         converted_obs = {
-            "video.image": main,  # [B,H,W,C]
-            "video.wrist_image": wrist,  # [B,H,W,C]
-            "state.state": state_bt,  # [B,1,8]
+            "video.image": main,  # [B,T,H,W,C]
+            "video.wrist_image": wrist,  # [B,T,H,W,C]
+            "state.state": state_bt,  # [B,1,D_state]
             "annotation.language.action_text": list(prompts),  # list[str], len=B
         }
         return converted_obs

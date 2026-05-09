@@ -38,6 +38,9 @@ from .gim_arm_robot_state import GimArmRobotState
 _DEFAULT_JOINT_LIMIT_LOW = np.array([-1.4, -3.0, 0.0, -1.5, -1.5, -1.88])
 _DEFAULT_JOINT_LIMIT_HIGH = np.array([1.4, 0.0, 3.0, 1.5, 1.5, 1.90])
 
+# Max absolute joint delta per RL step (rad). Keeps setpoints close to the current pose.
+_MAX_JOINT_DELTA_PER_STEP = 0.2
+
 
 @dataclass
 class GimArmRobotConfig:
@@ -133,6 +136,16 @@ class GimArmRobotConfig:
     success_hold_steps: int = 1
     """Number of consecutive steps in the target zone required for success."""
 
+    task_description: str = ""
+    """Natural-language instruction passed to VLA-style policies (:class:`RealWorldEnv`)."""
+
+    def __post_init__(self):
+        """Coerce list/nested config (e.g. from Hydra) to numpy arrays."""
+        self.target_ee_pose = np.asarray(self.target_ee_pose, dtype=np.float64)
+        self.joint_limit_low = np.asarray(self.joint_limit_low, dtype=np.float64)
+        self.joint_limit_high = np.asarray(self.joint_limit_high, dtype=np.float64)
+        self.reward_threshold = np.asarray(self.reward_threshold, dtype=np.float64)
+
 
 class GimArmEnv(gym.Env):
     """GimArm 6-DOF robot environment with joint-space actions.
@@ -190,18 +203,41 @@ class GimArmEnv(gym.Env):
         if self.config.is_dummy:
             return
 
-        # Wait for the robot to be ready.
+        # Wait for the robot to be ready (bounded wait — previously infinite loop).
         start_time = time.time()
+        deadline = start_time + 120.0
         while not self._controller.is_robot_up().wait()[0]:
             time.sleep(0.5)
             if time.time() - start_time > 30:
                 self._logger.warning(
                     f"Waited {time.time() - start_time:.0f}s for GimArm to be ready."
                 )
+            if time.time() > deadline:
+                raise RuntimeError(
+                    "GimArmEnv: is_robot_up() did not become True within 120s. "
+                    "Check CAN interface, arm power, and gim_arm_control."
+                )
+
+        self._logger.info("GimArm hardware ready; executing initial reset_joint ...")
 
         self._controller.reset_joint(self.config.reset_joint_qpos).wait()
         time.sleep(1.0)
         self._state = self._controller.get_state().wait()[0]
+        target_q = np.asarray(self.config.reset_joint_qpos, dtype=np.float64)
+        err = float(
+            np.max(np.abs(self._state.arm_joint_position.astype(np.float64) - target_q))
+        )
+        self._logger.info(
+            "GimArmEnv init: after reset_joint_qpos, max joint tracking error=%.4f rad",
+            err,
+        )
+        if err > 0.2:
+            self._logger.warning(
+                "Large tracking error after reset; retrying reset_joint once."
+            )
+            self._controller.reset_joint(self.config.reset_joint_qpos).wait()
+            time.sleep(1.0)
+            self._state = self._controller.get_state().wait()[0]
 
         self._open_cameras()
         self.camera_player = VideoPlayer(self.config.enable_camera_player)
@@ -301,12 +337,26 @@ class GimArmEnv(gym.Env):
         """
         start_time = time.time()
 
+        action = np.asarray(action, dtype=np.float64).reshape(-1)[:7].copy()
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
+        # Limit per-step joint change to ±_MAX_JOINT_DELTA_PER_STEP rad (relative to
+        # current joint angles). Gripper dim is unchanged: it must stay in [-1, 1]
+        # with |cmd| >= binary_gripper_threshold for open/close; clamping to ±0.2
+        # would disable the gripper.
         if not self.config.is_dummy:
-            q_target = np.clip(
-                action[:6], self._joint_limit_low, self._joint_limit_high
+            q_curr = np.asarray(self._state.arm_joint_position, dtype=np.float64)
+            dq = np.clip(
+                action[:6] - q_curr,
+                -_MAX_JOINT_DELTA_PER_STEP,
+                _MAX_JOINT_DELTA_PER_STEP,
             )
+            action[:6] = np.clip(
+                q_curr + dq, self._joint_limit_low, self._joint_limit_high
+            )
+
+        if not self.config.is_dummy:
+            q_target = action[:6].copy()
             self._controller.move_joints(q_target).wait()
 
             gripper_action = float(action[6])
@@ -334,6 +384,11 @@ class GimArmEnv(gym.Env):
     @property
     def num_steps(self):
         return self._num_steps
+
+    @property
+    def task_description(self) -> str:
+        """Used by :class:`RealWorldEnv` for ``obs[\"task_descriptions\"]``."""
+        return self.config.task_description
 
     def reset(self, joint_reset=False, seed=None, options=None):
         """Reset the environment to the rest pose."""
