@@ -1054,8 +1054,8 @@ def build_dreamzero_sft_dataloader(
         )
     max_chunk_size = model_cfg.action_head_cfg.config.diffusion_model_cfg.max_chunk_size
     num_frames = model_cfg.action_head_cfg.config.num_frames
-    state_horizon = model_cfg.get("state_horizon", 1)
     action_horizon = model_cfg.action_horizon
+    state_horizon = action_horizon
     max_seq_len = int(model_cfg.get("max_seq_len", 512))
     embodiment_tag_mapping = embodiment_tag_mapping_for_embodiment(
         embodiment_tag, model_cfg.get("embodiment_tag_mapping")

@@ -159,9 +159,17 @@ def convert_rollout_env_obs_with_layout(
         if isinstance(model_targets, str):
             if states.ndim == 1:
                 states = states[None, :]
-            elif states.ndim > 2:
+            elif states.ndim == 3:
+                # [B, T, D] chunk history from env — keep full time axis for DreamTransform.
+                converted[model_targets] = states
+            elif states.ndim == 2:
+                # [B, D] single-step rollout obs.
+                converted[model_targets] = states[:, None, :]
+            elif states.ndim > 3:
                 states = states.reshape(batch_size, -1)
-            converted[model_targets] = states[:, None, :]
+                converted[model_targets] = states[:, None, :]
+            else:
+                converted[model_targets] = states[:, None, :]
         else:
             joint_key, gripper_key = model_targets
             joint, gripper = _rollout_split_droid_state(states, batch_size)

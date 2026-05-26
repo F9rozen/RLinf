@@ -25,6 +25,9 @@ from rlinf.data.datasets.dreamzero.data_transforms import (
     convert_rollout_env_obs,
     rollout_obs_layout_for_embodiment,
 )
+from rlinf.data.datasets.dreamzero.rollout_temporal_obs import (
+    select_rollout_temporal_obs,
+)
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.dreamzero.dreamzero_config import DreamZeroConfig
 
@@ -57,6 +60,38 @@ class DreamZeroPolicy(VLA, BasePolicy):
             config.data_transforms, embodiment_tag
         )
         self._action_keys = tuple(action_keys)
+        self._rollout_ar_first_step = True
+        self._rollout_ar_task_key: Any = None
+
+    def reset_rollout_ar_state(self) -> None:
+        """Reset causal AR frame selection (first step → single frame)."""
+        self._rollout_ar_first_step = True
+        self._rollout_ar_task_key = None
+        action_head = getattr(self, "action_head", None)
+        if action_head is not None:
+            if hasattr(action_head, "language"):
+                action_head.language = None
+            if hasattr(action_head, "current_start_frame"):
+                action_head.current_start_frame = 0
+
+    def _maybe_reset_rollout_ar_for_task(self, env_obs: dict[str, Any]) -> None:
+        tasks = env_obs.get("task_descriptions")
+        if tasks is None:
+            return
+        task_key = tuple(tasks) if isinstance(tasks, list) else tasks
+        if self._rollout_ar_task_key is not None and task_key != self._rollout_ar_task_key:
+            self.reset_rollout_ar_state()
+        self._rollout_ar_task_key = task_key
+
+    def _prepare_rollout_env_obs(self, env_obs: dict[str, Any]) -> dict[str, Any]:
+        """Apply AR frame selection before modality conversion."""
+        self._maybe_reset_rollout_ar_for_task(env_obs)
+        prepared = select_rollout_temporal_obs(
+            env_obs,
+            ar_first_step=self._rollout_ar_first_step,
+        )
+        self._rollout_ar_first_step = False
+        return prepared
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -262,15 +297,22 @@ class DreamZeroPolicy(VLA, BasePolicy):
         """
         input:
             env_obs:
-                - main_images: [B,H,W,C] uint8
-                - wrist_images: [B,H,W,C] (optional, embodiment-specific)
-                - extra_view_images: [B,N,H,W,C] (optional, e.g. oxe_droid)
-                - states: [B,D]
+                - main_images: [B,H,W,C] or [B,T,H,W,C] uint8
+                - wrist_images: same layout as main_images (optional)
+                - extra_view_images: [B,N,H,W,C] or [B,T,N,H,W,C] (optional)
+                - states: [B,D], [B,1,D], or [B,T,D]
                 - task_descriptions: list[str] or None
+            AR rollout (when ``[B,T,...]``):
+                - first call: last frame only (T=1 for WAN)
+                - later calls: frames at offsets (-15,-10,-5,0) from last → T=4 for WAN
         output:
             actions: np.ndarray [B, num_action_chunks, action_dim]
             result: dict  # compatible with rollout interface"""
 
+        if kwargs.get("reset_ar", False):
+            self.reset_rollout_ar_state()
+
+        env_obs = self._prepare_rollout_env_obs(env_obs)
         converted_obs = self._observation_convert(env_obs)
         batch = Batch(obs=converted_obs)
         # ---------- DreamZero inference ----------

@@ -62,6 +62,29 @@ def concat_multiview_video(embodiment_tag: Any, images: Any) -> np.ndarray:
 class DreamTransform(DreamTransformBase):
     """DreamTransform that delegates multi-view layout to ``data_transforms`` registry."""
 
+    def _prepare_state(self, data: dict):
+        """Use ``action_horizon`` for training; rollout keeps one state per video frame."""
+        if "state" not in data:
+            return super()._prepare_state(data)
+
+        state = data["state"]
+        if self.training:
+            return super()._prepare_state(data)
+
+        n_state_dims = state.shape[-1]
+        if n_state_dims > self.max_state_dim:
+            state = state[:, : self.max_state_dim]
+            n_state_dims = self.max_state_dim
+        else:
+            state = np.pad(
+                state,
+                ((0, 0), (0, self.max_state_dim - n_state_dims)),
+                "constant",
+            )
+        state_mask = np.zeros_like(state).astype(bool)
+        state_mask[:, :n_state_dims] = True
+        return state, state_mask, state.shape[0]
+
     def apply_batch(self, data: dict, batch_size: int) -> dict:
         """Collate with RLinf prompt wrapping (supports all registered embodiments)."""
         import tree

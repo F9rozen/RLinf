@@ -127,6 +127,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         )
 
     dreamzero_config = DreamZeroConfig(**config_dict)
+    num_action_chunks = int(cfg.get("num_action_chunks", 16))
+    dreamzero_config.num_action_chunks = num_action_chunks
+    dreamzero_config.action_horizon = int(
+        cfg.get("action_horizon", num_action_chunks)
+    )
 
     has_full_model_weights = False
     st = st_index = None

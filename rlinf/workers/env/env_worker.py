@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -38,6 +39,7 @@ from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
     split_dict,
+    stack_obs_list_along_time,
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
@@ -412,7 +414,12 @@ class EnvWorker(Worker):
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
         if isinstance(obs_list, (list, tuple)):
-            extracted_obs = obs_list[-1] if obs_list else None
+            if self.cfg.actor.model.model_type == SupportedModel.DREAMZERO:
+                extracted_obs = (
+                    stack_obs_list_along_time(list(obs_list)) if obs_list else None
+                )
+            else:
+                extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)

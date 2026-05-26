@@ -154,6 +154,52 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
     return ret
 
 
+# Keys that are identical across chunk micro-steps (e.g. language prompt per env).
+_CHUNK_OBS_PASSTHROUGH_KEYS = frozenset({"task_descriptions"})
+
+
+def stack_obs_list_along_time(obs_list: list[dict[str, Any]]) -> dict[str, Any]:
+    """Stack per-step env obs dicts into one dict with time dimension at axis 1.
+
+    Each step observation uses batch-first layout ``[B, ...]``. The merged dict uses
+    ``[B, T, ...]`` for tensor fields (``T`` = number of chunk micro-steps).
+
+    Non-tensor fields listed in ``_CHUNK_OBS_PASSTHROUGH_KEYS`` are taken from the
+    last step unchanged (e.g. ``task_descriptions``).
+    """
+    if not obs_list:
+        return {}
+
+    keys = obs_list[0].keys()
+    merged: dict[str, Any] = {}
+    for key in keys:
+        step_values = [step[key] for step in obs_list if step.get(key) is not None]
+        if not step_values:
+            continue
+
+        if key in _CHUNK_OBS_PASSTHROUGH_KEYS:
+            merged[key] = step_values[-1]
+            continue
+
+        v0 = step_values[0]
+        if isinstance(v0, torch.Tensor):
+            merged[key] = torch.stack(step_values, dim=1)
+        elif isinstance(v0, np.ndarray):
+            merged[key] = torch.stack(
+                [torch.as_tensor(v) for v in step_values], dim=1
+            )
+        elif isinstance(v0, dict):
+            nested_steps = [
+                step[key] for step in obs_list if isinstance(step.get(key), dict)
+            ]
+            merged[key] = stack_list_of_dict_tensor(nested_steps, dim=1)
+        else:
+            raise ValueError(
+                f"Cannot stack obs_list field {key!r} with type {type(v0)}."
+            )
+    return merged
+
+
 def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
     if len(list_of_dict) == 0:
         return {}

@@ -388,9 +388,15 @@ class MultiStepRolloutWorker(Worker):
         gc.collect()
         self.torch_platform.empty_cache()
 
+    def _reset_dreamzero_rollout_ar_state(self) -> None:
+        for model in (self.hf_model, self.expert_model):
+            if model is not None and hasattr(model, "reset_rollout_ar_state"):
+                model.reset_rollout_ar_state()
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
+        self._reset_dreamzero_rollout_ar_state()
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
@@ -458,6 +464,7 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        self._reset_dreamzero_rollout_ar_state()
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",

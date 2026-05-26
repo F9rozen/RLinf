@@ -12,8 +12,8 @@ metadata_json_path: null
 
 action_dim: 32
 
-state_horizon: 1
-action_horizon: 24
+num_action_chunks: 16
+action_horizon: ${actor.model.num_action_chunks}
 
 num_action_per_block: 24
 

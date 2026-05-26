@@ -117,12 +117,16 @@ class LiberoSimDataTransform:
         embodiment_tag_mapping: dict[str, int],
     ) -> ComposedModalityTransform:
         """Build the full ``ComposedModalityTransform`` chain for libero_sim."""
+        num_chunks = int(
+            cfg.get(
+                "num_action_chunks",
+                cfg.get("action_horizon", LiberoSimDataTransform.DEFAULT_ACTION_HORIZON),
+            )
+        )
+        action_horizon = int(cfg.get("action_horizon", num_chunks))
         return LiberoSimDataTransform._build_composed_transform(
             tokenizer_path=tokenizer_path,
-            state_horizon=int(cfg.get("state_horizon", 1)),
-            action_horizon=int(
-                cfg.get("action_horizon", LiberoSimDataTransform.DEFAULT_ACTION_HORIZON)
-            ),
+            action_horizon=action_horizon,
             max_state_dim=int(cfg.get("max_state_dim", 64)),
             max_action_dim=int(cfg.get("max_action_dim", 32)),
             max_length=int(cfg.get("max_seq_len", 512)),
@@ -139,7 +143,6 @@ class LiberoSimDataTransform:
     @staticmethod
     def _build_composed_transform(
         tokenizer_path: str,
-        state_horizon: int,
         action_horizon: int,
         max_state_dim: int,
         max_action_dim: int,
@@ -195,7 +198,7 @@ class LiberoSimDataTransform:
                 max_state_dim=max_state_dim,
                 max_action_dim=max_action_dim,
                 max_length=max_length,
-                state_horizon=state_horizon,
+                state_horizon=action_horizon,
                 action_horizon=action_horizon,
                 tokenizer_path=tokenizer_path,
                 embodiment_tag_mapping=embodiment_tag_mapping,
