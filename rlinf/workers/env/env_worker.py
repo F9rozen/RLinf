@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -39,6 +40,7 @@ from rlinf.utils.nested_dict_process import (
     copy_dict_tensor,
     split_dict,
     update_nested_cfg,
+    stack_obs_list_along_time,
 )
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.history_manager import HistoryManager
@@ -411,7 +413,9 @@ class EnvWorker(Worker):
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
-        if isinstance(obs_list, (list, tuple)):
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO:
+            extracted_obs = stack_obs_list_along_time(obs_list) if obs_list else None
+        elif isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
@@ -1111,12 +1115,25 @@ class EnvWorker(Worker):
                             "final_obs": env_batch["final_obs"],
                         },
                     )
-                    if self.collect_transitions:
-                        next_obs = (
-                            env_output.final_obs
-                            if env_output.dones.any() and self.cfg.env.train.auto_reset
-                            else env_output.obs
-                        )
+                    if self.collect_transitions and rollout_result.forward_inputs.get(
+                        "action", None
+                    ) is not None:
+                        # DreamZero replay expects temporal observations with a fixed
+                        # chunk length (e.g. T=16). `final_obs` may be a single frame
+                        # after auto-reset, so always keep `obs` here to avoid mixing
+                        # [B, T, ...] and [B, ...] in the same trajectory buffer.
+                        if (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.DREAMZERO
+                        ):
+                            next_obs = env_output.obs
+                        else:
+                            next_obs = (
+                                env_output.final_obs
+                                if env_output.dones.any()
+                                and self.cfg.env.train.auto_reset
+                                else env_output.obs
+                            )
                         self.rollout_results[stage_id].append_transitions(
                             curr_obs, next_obs
                         )

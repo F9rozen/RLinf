@@ -318,6 +318,9 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if expert_target is not None:
                     result["forward_inputs"]["model_action"] = expert_target
+                expert_env_action = expert_forward_inputs.get("action")
+                if expert_env_action is not None:
+                    result["forward_inputs"]["expert_action"] = expert_env_action
                 expert_label_flag = True
 
         if isinstance(actions, np.ndarray):

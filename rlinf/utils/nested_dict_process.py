@@ -153,6 +153,32 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
             raise ValueError(f"{key=}, {type(_v0)} is not supported!")
     return ret
 
+def stack_obs_list_along_time(obs_list: list[dict]) -> dict:
+    """Stack obs_list to a dict with the same keys as obs_list[-1], tensor in dim=1 insert T."""
+    if not obs_list:
+        return {}
+
+    merged = {}
+    for key in obs_list[0].keys():
+        step_values = [step[key] for step in obs_list if step.get(key) is not None]
+        if not step_values:
+            continue
+
+        v0 = step_values[0]
+        if isinstance(v0, torch.Tensor):
+            merged[key] = torch.stack(step_values, dim=1)   # [B, ...] → [B, T, ...]
+        elif isinstance(v0, (list, tuple)):
+            # task_descriptions: list[str] 长度 B → list[list[str]]，外层 B、内层 T
+            batch_size = len(v0)
+            merged[key] = [
+                [step_values[t][b] for t in range(len(step_values))]
+                for b in range(batch_size)
+            ]
+        elif isinstance(v0, str):
+            merged[key] = list(step_values)  # 每步一个 str → 长度 T 的 list
+        else:
+            raise ValueError(f"Cannot stack field {key!r} with type {type(v0)}.")
+    return merged
 
 def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
     if len(list_of_dict) == 0:

@@ -14,13 +14,13 @@
 
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import torch
 
-if TYPE_CHECKING:
-    pass
-
+from rlinf.data.datasets.dreamzero.rollout_temporal_obs import (
+    stash_task_descriptions_in_obs,
+)
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
     put_tensor_device,
@@ -450,14 +450,32 @@ class Trajectory:
             f"Expected 2D mask after processing (traj len, bsz), got {mask.shape=}"
         )
         traj_len = int(mask.shape[0])
+        for field in (self.actions, self.rewards, self.intervene_flags):
+            if field is not None and field.dim() >= 2:
+                traj_len = min(traj_len, int(field.shape[0]))
+        if self.forward_inputs:
+            for value in self.forward_inputs.values():
+                if torch.is_tensor(value) and value.dim() >= 2:
+                    traj_len = min(traj_len, int(value.shape[0]))
+        if self.curr_obs:
+            for value in self.curr_obs.values():
+                if torch.is_tensor(value) and value.dim() >= 2:
+                    traj_len = min(traj_len, int(value.shape[0]))
+        mask = mask[:traj_len]
 
         def apply_mask(tensor, i):
-            return tensor[:, i][mask[:, i]].unsqueeze(1) if tensor is not None else None
+            if tensor is None:
+                return None
+            tensor = tensor[:traj_len]
+            return tensor[:, i][mask[:, i]].unsqueeze(1)
 
         def apply_mask_to_dict(d, i):
-            return (
-                {k: v[:, i][mask[:, i]].unsqueeze(1) for k, v in d.items()} if d else {}
-            )
+            if not d:
+                return {}
+            return {
+                k: v[:traj_len, i][mask[:, i]].unsqueeze(1)
+                for k, v in d.items()
+            }
 
         filtered_trajectories = []
         for i in range(mask.shape[1]):
@@ -539,14 +557,51 @@ class EmbodiedRolloutResult:
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
+    def _infer_chunk_step_width(
+        self,
+        result: "ChunkStepResult",
+    ) -> int:
+        """Infer per-chunk env-step count for reward-shaped tensors."""
+        if self.rewards:
+            return int(self.rewards[-1].shape[1])
+        for field in (
+            result.dones,
+            result.terminations,
+            result.truncations,
+            result.rewards,
+        ):
+            if field is not None and field.ndim >= 2:
+                return int(field.shape[1])
+        if result.actions is not None and result.actions.ndim == 2:
+            flat = int(result.actions.shape[1])
+            for env_action_dim in (7, 8, 14, 16, 32):
+                if flat > 0 and flat % env_action_dim == 0:
+                    return flat // env_action_dim
+        return 1
+
+    def _placeholder_rewards(self, result: "ChunkStepResult") -> torch.Tensor:
+        bsz = int(result.actions.shape[0])
+        if self.rewards:
+            return torch.zeros_like(self.rewards[-1])
+        num_chunks = self._infer_chunk_step_width(result)
+        device = result.actions.device
+        return torch.zeros((bsz, num_chunks), dtype=torch.float32, device=device)
+
     def append_step_result(self, result: ChunkStepResult):
-        if result.actions is not None:
-            self.actions.append(result.actions)
-            self.intervene_flags.append(
-                torch.zeros_like(result.actions, dtype=torch.bool)
-            )
-        if result.rewards is not None:
-            self.rewards.append(result.rewards)
+        # DreamZero DAgger may skip the bootstrap / single-frame step (no action in
+        # forward_inputs). Do not record partial steps, or rewards/flags lengths diverge.
+        if result.actions is None:
+            return
+
+        self.actions.append(result.actions)
+        self.intervene_flags.append(
+            torch.zeros_like(result.actions, dtype=torch.bool)
+        )
+        self.rewards.append(
+            result.rewards
+            if result.rewards is not None
+            else self._placeholder_rewards(result)
+        )
         if result.terminations is not None:
             self.terminations.append(result.terminations)
         if result.truncations is not None:
@@ -618,14 +673,11 @@ class EmbodiedRolloutResult:
                     last_fi["action"] = (
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
-                last_fi.pop("model_action", None)
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
-        if "task_descriptions" in curr_obs:
-            curr_obs.pop("task_descriptions")
-        if "task_descriptions" in next_obs:
-            next_obs.pop("task_descriptions")
+        stash_task_descriptions_in_obs(curr_obs)
+        stash_task_descriptions_in_obs(next_obs)
         self.curr_obs.append(curr_obs)
         self.next_obs.append(next_obs)
 

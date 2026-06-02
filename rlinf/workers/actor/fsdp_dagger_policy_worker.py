@@ -92,7 +92,18 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
 
     def _prepare_sft_batch(self, batch):
         """Prepare model-specific DAgger training inputs."""
-        return self.model.prepare_dagger_sft_batch(batch)
+        forward_inputs = batch.get("forward_inputs", batch)
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO:
+            curr_obs = batch.get("curr_obs")
+            if curr_obs is None:
+                raise ValueError(
+                    "DreamZero DAgger replay batch is missing `curr_obs`; "
+                    "cannot rebuild SFT inputs from raw video."
+                )
+            return self.model.prepare_dagger_sft_batch(
+                forward_inputs, curr_obs=curr_obs
+            )
+        return self.model.prepare_dagger_sft_batch(forward_inputs)
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -137,14 +148,14 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
                 is_last_micro_batch=(mb_idx + 1) == self.gradient_accumulation,
             )
             with self.amp_context:
-                actor_loss = self.forward_actor(batch["forward_inputs"])
+                actor_loss = self.forward_actor(batch)
             actor_loss = actor_loss / self.gradient_accumulation
             with backward_ctx:
                 self.grad_scaler.scale(actor_loss).backward()
             gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
 
-        actor_grad_norm = self.model.clip_grad_norm_(
-            max_norm=self.cfg.actor.optim.clip_grad
+        actor_grad_norm = self._strategy.clip_grad_norm_(
+            model=self.model,
         )
         self.optimizer.step()
         self.lr_scheduler.step()
