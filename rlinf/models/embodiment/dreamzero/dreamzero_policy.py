@@ -24,13 +24,22 @@ from tianshou.data import Batch
 from rlinf.data.datasets.dreamzero.data_transforms import (
     collect_dreamzero_dataset_keys,
     convert_rollout_env_obs,
+    embodiment_tag_mapping_for_embodiment,
     rollout_obs_layout_for_embodiment,
 )
 from rlinf.data.datasets.dreamzero.data_transforms.dream_transform import DreamTransform
+from rlinf.data.datasets.dreamzero.dagger_multi_anchor import (
+    DaggerOfflineSftLayout,
+    build_offline_sft_raw_from_trajectory,
+    sample_valid_window_index,
+)
+from rlinf.data.datasets.dreamzero.dreamzero import DreamZeroCollator
 from rlinf.data.datasets.dreamzero.rollout_temporal_obs import (
     restore_task_descriptions_from_obs,
     select_rollout_tail_frame_obs,
 )
+from rlinf.data.datasets.dreamzero.sampling_strategy import EmptyTemporalSampleError
+from rlinf.data.datasets.dreamzero.utils import collate_ready_sample
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.dreamzero.dreamzero_config import DreamZeroConfig
 
@@ -63,6 +72,110 @@ class DreamZeroPolicy(VLA, BasePolicy):
             config.data_transforms, embodiment_tag
         )
         self._action_keys = tuple(action_keys)
+        self._sft_collator: DreamZeroCollator | None = None
+        self._offline_sft_rng = np.random.default_rng()
+
+    @staticmethod
+    def _nested_config_get(cfg: Any, *keys: str, default: Any = None) -> Any:
+        """Read nested config fields from dict-like or attribute-style configs."""
+        cur: Any = cfg
+        for key in keys:
+            if cur is None:
+                return default
+            if isinstance(cur, dict):
+                cur = cur.get(key)
+            else:
+                cur = getattr(cur, key, None)
+        return default if cur is None else cur
+
+    def _get_offline_sft_layout(self) -> DaggerOfflineSftLayout:
+        max_chunk_size = int(
+            self._nested_config_get(
+                self.config,
+                "action_head_cfg",
+                "config",
+                "diffusion_model_cfg",
+                "max_chunk_size",
+                default=4,
+            )
+        )
+        _, _, num_chunks, _ = self._dagger_get_rollout_layout()
+        sft_action_horizon = int(
+            getattr(self.config, "sft_action_horizon", None)
+            or getattr(self.config, "action_horizon", 16)
+            or 16
+        )
+        macro_stride = int(getattr(self.config, "dagger_sft_macro_stride", 24) or 24)
+        state_horizon = int(getattr(self.config, "state_horizon", 1) or 1)
+        return DaggerOfflineSftLayout(
+            max_chunk_size=max_chunk_size,
+            action_horizon=sft_action_horizon,
+            num_action_chunks=num_chunks,
+            macro_stride=macro_stride,
+            state_horizon=state_horizon,
+        )
+
+    def _get_sft_collator(self) -> DreamZeroCollator:
+        if self._sft_collator is None:
+            tokenizer_path = str(
+                getattr(self.config, "tokenizer_path", None) or "google/umt5-xxl"
+            )
+            max_seq_len = int(getattr(self.config, "max_seq_len", 512) or 512)
+            tag = self.config.embodiment_tag
+            mapping = embodiment_tag_mapping_for_embodiment(tag, None)
+            self._sft_collator = DreamZeroCollator(
+                tokenizer_path=tokenizer_path,
+                max_seq_len=max_seq_len,
+                embodiment_tag_mapping=dict(mapping),
+            )
+        return self._sft_collator
+
+    def make_offline_sft_sample_builder(self):
+        """Return a replay-buffer callback that builds one offline-SFT raw sample."""
+        layout = rollout_obs_layout_for_embodiment(self.config.embodiment_tag)
+        _, _, action_keys, language_keys = collect_dreamzero_dataset_keys(
+            self.config.data_transforms, self.config.embodiment_tag
+        )
+        layout_cfg = self._get_offline_sft_layout()
+        env_action_dim = self._dagger_env_action_dim()
+        language_key = language_keys[0]
+        action_key = action_keys[0]
+        rng = self._offline_sft_rng
+
+        def _builder(trajectory) -> dict[str, Any] | None:
+            try:
+                chunk_anchor, batch_idx = sample_valid_window_index(
+                    trajectory, layout_cfg=layout_cfg, rng=rng
+                )
+                return build_offline_sft_raw_from_trajectory(
+                    trajectory,
+                    chunk_anchor,
+                    batch_idx,
+                    layout=layout,
+                    language_model_key=language_key,
+                    action_model_key=action_key,
+                    layout_cfg=layout_cfg,
+                    env_action_dim=env_action_dim,
+                )
+            except EmptyTemporalSampleError:
+                return None
+
+        return _builder
+
+    def collate_offline_sft_dagger_batch(
+        self, raw_samples: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Apply the offline SFT transform chain and collate like ``DreamZeroCollator``."""
+        transform = self.config.data_transforms
+        was_training = getattr(transform, "training", True)
+        transform.train()
+        features: list[dict[str, Any]] = []
+        for raw in raw_samples:
+            features.append(collate_ready_sample(transform(raw)))
+        if not was_training:
+            transform.eval()
+        collator = self._get_sft_collator()
+        return collator(features)
 
     _DAGGER_FORWARD_RESERVED_KEYS: frozenset[str] = frozenset(
         {"action", "expert_action", "model_action", "prev_logprobs", "prev_values"}
@@ -650,6 +763,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
         # Model predicts up to action_horizon steps; env rollout executes num_chunks.
         if int(actions.shape[1]) > num_chunks:
             env_actions = actions[:, :num_chunks, :]
+        elif int(actions.shape[1]) < num_chunks:
+            pad_count = num_chunks - int(actions.shape[1])
+            pad = np.repeat(actions[:, -1:, :], pad_count, axis=1)
+            env_actions = np.concatenate([actions, pad], axis=1)
         else:
             env_actions = actions
 
@@ -752,6 +869,26 @@ class DreamZeroPolicy(VLA, BasePolicy):
         else:
             raise NotImplementedError
 
+    @staticmethod
+    def _normalize_sft_outputs(outputs: Any) -> dict[str, torch.Tensor]:
+        """Extract ``loss``, ``dynamics_loss``, and ``action_loss`` from VLA outputs."""
+        if hasattr(outputs, "data"):
+            outputs = outputs.data
+        if not isinstance(outputs, dict):
+            raise ValueError(
+                "sft_forward expects dict or BatchFeature outputs from VLA.forward."
+            )
+        missing = [key for key in ("loss", "dynamics_loss", "action_loss") if key not in outputs]
+        if missing:
+            raise ValueError(
+                f"sft_forward requires {missing} in the outputs; got keys {sorted(outputs)}."
+            )
+        return {
+            "loss": outputs["loss"],
+            "dynamics_loss": outputs["dynamics_loss"],
+            "action_loss": outputs["action_loss"],
+        }
+
     def sft_forward(self, data=None, **kwargs):
         # Mark the start of each training iteration so PyTorch knows when
         # to reclaim memory held by CUDA graphs from the previous iteration.
@@ -767,17 +904,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 data["observation"], data["actions"]
             )
             outputs = super().forward(inputs)
-            loss = outputs.get("loss") if hasattr(outputs, "get") else None
-            if loss is None:
-                raise ValueError("sft_forward requires `loss` in the outputs.")
-            return loss
+            return self._normalize_sft_outputs(outputs)
 
         outputs = super().forward(data)
-        if hasattr(outputs, "data"):
-            outputs = outputs.data
-        if "loss" not in outputs:
-            raise ValueError("sft_forward requires `loss` in the outputs.")
-        return dict(outputs)
+        return self._normalize_sft_outputs(outputs)
 
     def default_forward(
         self,

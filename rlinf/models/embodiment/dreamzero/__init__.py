@@ -162,6 +162,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         cfg.get("relative_action_per_horizon", False)
     )
     dreamzero_config.relative_action_keys = list(cfg.get("relative_action_keys") or [])
+    dreamzero_config.dagger_sft_macro_stride = int(cfg.get("dagger_sft_macro_stride", 24))
+    if cfg.get("sft_action_horizon", None) is not None:
+        dreamzero_config.sft_action_horizon = int(cfg.get("sft_action_horizon"))
 
     model = DreamZeroPolicy(
         config=dreamzero_config,

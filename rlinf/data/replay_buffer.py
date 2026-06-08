@@ -19,8 +19,9 @@ import os
 import pickle as pkl
 import shutil
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -292,6 +293,8 @@ class TrajectoryReplayBuffer:
         # Trajectory file path: dict mapping trajectory_id to trajectory file path
         # this enables each trajectory to be saved to or loaded from a separate file
         self._trajectory_file_path: dict[int, str] = {}
+        self._trajectory_cache_size = int(cache_size)
+        self._trajectory_store: OrderedDict[int, Trajectory] = OrderedDict()
 
         self._trajectory_counter = 0  # Next trajectory ID to use
         self._index_version = 0
@@ -437,6 +440,40 @@ class TrajectoryReplayBuffer:
 
         return trajectory
 
+    def _clone_trajectory(self, trajectory: Trajectory) -> Trajectory:
+        cloned = Trajectory(max_episode_length=trajectory.max_episode_length)
+        for field_name in trajectory.__dataclass_fields__:
+            value = getattr(trajectory, field_name, None)
+            if value is not None:
+                setattr(cloned, field_name, clone_dict_of_tensors(value))
+        cloned.model_weights_id = trajectory.model_weights_id
+        return cloned
+
+    def _store_trajectory_in_memory(
+        self, trajectory_id: int, trajectory: Trajectory
+    ) -> None:
+        """Keep a CPU copy for offline-SFT sampling when auto_save is disabled."""
+        self._trajectory_store[trajectory_id] = self._clone_trajectory(trajectory)
+        self._trajectory_store.move_to_end(trajectory_id)
+        while len(self._trajectory_store) > self._trajectory_cache_size:
+            self._trajectory_store.popitem(last=False)
+
+    def _resolve_trajectory(
+        self, trajectory_id: int, model_weights_id: str
+    ) -> Trajectory:
+        """Load a trajectory from the in-memory store or disk."""
+        if trajectory_id not in self._trajectory_index:
+            raise ValueError(f"Trajectory {trajectory_id} not found in index")
+        if trajectory_id in self._trajectory_store:
+            return self._trajectory_store[trajectory_id]
+        if trajectory_id in self._trajectory_file_path:
+            return self._load_trajectory(trajectory_id, model_weights_id)
+        raise KeyError(
+            f"Trajectory {trajectory_id} is not available in memory or on disk. "
+            f"Increase replay_buffer.cache_size (current {self._trajectory_cache_size}) "
+            "or enable replay_buffer.auto_save."
+        )
+
     def add_trajectories(self, trajectories: list[Trajectory]):
         """
         Add trajectories to the buffer.
@@ -502,6 +539,7 @@ class TrajectoryReplayBuffer:
                     trajectory_id,
                     self._flatten_trajectory(trajectory),
                 )
+            self._store_trajectory_in_memory(trajectory_id, trajectory)
 
         # Save metadata/index after all trajectory saves finish
         if self.auto_save:
@@ -686,7 +724,7 @@ class TrajectoryReplayBuffer:
             cursor = 0
             for tid in miss_traj_ids:
                 model_weights_id = self._trajectory_index[tid]["model_weights_id"]
-                trajectory = self._load_trajectory(tid, model_weights_id)
+                trajectory = self._resolve_trajectory(tid, model_weights_id)
                 flat_trajectory = self._flatten_trajectory(trajectory)
                 miss_flats.append(flat_trajectory)
                 traj_offsets[tid] = cursor
@@ -708,6 +746,65 @@ class TrajectoryReplayBuffer:
             )
 
         return batch if batch is not None else {}
+
+    def sample_offline_sft_raw(
+        self,
+        num_samples: int,
+        sample_builder: Callable[[Trajectory], dict[str, Any] | None],
+        *,
+        max_attempts: int = 64,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Sample ``num_samples`` offline-SFT-style raw modality dicts from trajectories.
+
+        ``sample_builder`` receives a loaded :class:`Trajectory` and returns one raw
+        sample dict, or ``None`` to draw another trajectory.
+        """
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be positive, got {num_samples}.")
+        if self._total_samples == 0:
+            raise RuntimeError("Cannot sample from an empty buffer.")
+
+        window_size = max(0, int(self.sample_window_size))
+        with self._index_lock:
+            window_ids = (
+                list(self._trajectory_id_list[-window_size:])
+                if window_size > 0
+                else list(self._trajectory_id_list)
+            )
+        if not window_ids:
+            raise RuntimeError("Replay buffer has no trajectories in the sampling window.")
+
+        samples: list[dict[str, Any]] = []
+        attempts = 0
+        attempt_budget = max(int(max_attempts), int(num_samples) * int(max_attempts))
+        while len(samples) < num_samples and attempts < attempt_budget:
+            attempts += 1
+            trajectory_id = int(
+                window_ids[
+                    int(
+                        torch.randint(
+                            len(window_ids),
+                            (1,),
+                            generator=self.random_generator,
+                        ).item()
+                    )
+                ]
+            )
+            model_weights_id = self._trajectory_index[trajectory_id]["model_weights_id"]
+            trajectory = self._resolve_trajectory(trajectory_id, model_weights_id)
+            try:
+                raw = sample_builder(trajectory)
+            except Exception:
+                continue
+            if raw is not None:
+                samples.append(raw)
+
+        if len(samples) < num_samples:
+            raise RuntimeError(
+                f"sample_offline_sft_raw collected {len(samples)}/{num_samples} samples "
+                f"after {attempts} attempts."
+            )
+        return {"_offline_sft_raw_samples": samples}
 
     def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
         flat: dict[str, object] = {}
@@ -902,6 +999,7 @@ class TrajectoryReplayBuffer:
         self._trajectory_index.clear()
         self._trajectory_id_list.clear()
         self._trajectory_file_path.clear()
+        self._trajectory_store.clear()
 
         # Clear cache
         if self._flat_trajectory_cache is not None:

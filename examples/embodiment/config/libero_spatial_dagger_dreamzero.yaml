@@ -3,7 +3,7 @@ defaults:
   - env/libero_spatial@env.eval
   - model/dreamzero_5b@actor.model
   - training_backend/fsdp@actor.fsdp_config
-  - weight_syncer/patch_syncer@weight_syncer
+  - weight_syncer/bucket_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
 hydra:
@@ -29,7 +29,7 @@ runner:
     experiment_name: "libero_spatial_dagger_dreamzero"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 2000
+  max_epochs: 1000
   max_steps: -1
 
   only_eval: False
@@ -45,14 +45,18 @@ algorithm:
     # beta scheduling args. Expert acts with the probability of beta, while student acts with 1 - beta
     init_beta: 1.0
     beta_schedule: "exponential" # beta_t = beta_{t-1} * beta_decay
-    beta_decay: 0.999
+    beta_decay: 0.998
+    beta_min: 0.85
     # only_save_expert controls dagger logic. 
     # If set False, all data will be re-labeled by expert and saved (classic-dagger)
     # If set True, only expert data will be saved (hg-dagger, always used in real-world exp)
-    only_save_expert: False
+    only_save_expert: True
+    # DAgger SFT uses offline multi_anchor windows (4×action_horizon, 33 video frames),
+    # identical to libero_sft_dreamzero_5b.yaml.
+    sft_align_offline: True
 
   rollout_epoch: 1
-  eval_rollout_epoch: 5
+  eval_rollout_epoch: 4
   gamma: 0.99
 
   update_epoch: 1
@@ -75,9 +79,9 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 2000
-    min_buffer_size: 4
-    sample_window_size: 2000
+    cache_size: 512
+    min_buffer_size: 16
+    sample_window_size: 128
     auto_save: False
 
 env:
@@ -113,8 +117,8 @@ rollout:
   collect_transitions: True  # required: store curr_obs (16-frame video) for DAgger SFT
 
   model:
-    #model_path: /mnt/project_rlinf/guozhen/test_wam/results/5b-refactor/step_9000_hf_model
-    model_path: /mnt/project_rlinf_hs/lyh/data/weight/wan-5b
+    #model_path: /mnt/project_rlinf/guozhen/test_wam/results/5b-refactor/step_3000_hf_model
+    model_path: /mnt/project_rlinf_hs/lyh/data/weight/wan-5b-6000step
     precision: ${actor.model.precision}
 
   expert_model: # define expert model_path here
@@ -131,16 +135,21 @@ actor:
 
   model:
     #model_path: /mnt/project_rlinf/guozhen/test_wam/results/5b-refactor/step_9000_hf_model
-    model_path: /mnt/project_rlinf_hs/lyh/data/weight/wan-5b
-    num_action_chunks: 16
+    model_path: /mnt/project_rlinf_hs/lyh/data/weight/wan-5b-6000step
+    num_action_chunks: 24
+    action_horizon: 16
+    num_action_per_block: 16
+    sft_action_horizon: 16
+    dagger_sft_macro_stride: 24
     tokenizer_path: /mnt/project_rlinf/liyanghao/data/models/umt5-xxl
     diffusion_model_pretrained_path: /mnt/project_rlinf/hf_models/Wan2.2-TI2V-5B # https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B
     image_encoder_pretrained_path: /mnt/project_rlinf_hs/yuanhuining/models/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth # https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P
     text_encoder_pretrained_path: /mnt/project_rlinf/hf_models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth # https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B
     vae_pretrained_path: /mnt/project_rlinf/hf_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth # https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B
-    # Rollout / DAgger: 16 env steps per chunk → curr_obs [B,16,H,W,C], SFT label 16×7 env
-    # actions (q99-normalized to [B,16,32], padded to model action_horizon=24 for loss).
-    # Standard LeRobot SFT (multi_anchor) is unchanged and uses max_chunk_size×action_horizon.
+    # Rollout executes num_action_chunks env steps per macro-step; DAgger SFT (when
+    # sft_align_offline=True) builds the same 4×action_horizon / 33-frame multi_anchor
+    # windows as offline libero_sft_dreamzero_5b. Requires num_action_chunks ==
+    # dagger_sft_macro_stride so each replay chunk covers one macro anchor stride.
     state_horizon: 1
     # 160x320 matches eval/SFT; 176 height -> latent H=11 vs DiT output H=10 (patch stride 2)
     target_video_height: 160
@@ -151,16 +160,16 @@ actor:
     is_lora: False
 
   optim:
-    lr: 1e-5
+    lr: 3.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     weight_decay: 1e-10
-    clip_grad: 5.0
+    clip_grad: 1.0
     warmup_style: "cosine"
-    lr_warmup_steps: 20
-    total_training_steps: 8000
+    lr_warmup_steps: 0
+    total_training_steps: 500
 
   fsdp_config:
     strategy: "fsdp2"

@@ -90,8 +90,27 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         if intervene_traj_list:
             self.replay_buffer.add_trajectories(intervene_traj_list)
 
+    def _is_offline_sft_collated_batch(self, batch: dict) -> bool:
+        return (
+            "images" in batch
+            and "action" in batch
+            and "curr_obs" not in batch
+            and not batch.get("_dagger_replay_batch")
+        )
+
     def _prepare_sft_batch(self, batch):
         """Prepare model-specific DAgger training inputs."""
+        if self._is_offline_sft_collated_batch(batch):
+            return batch
+
+        if (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
+            and "_offline_sft_raw_samples" in batch
+        ):
+            return self.model.collate_offline_sft_dagger_batch(
+                batch["_offline_sft_raw_samples"]
+            )
+
         forward_inputs = batch.get("forward_inputs", batch)
         if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO:
             curr_obs = batch.get("curr_obs")
@@ -118,6 +137,11 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             use_action_chunk_loss=use_action_chunk_loss,
         )
 
+    def _dagger_sft_align_offline(self) -> bool:
+        return bool(
+            self.cfg.algorithm.get("dagger", {}).get("sft_align_offline", False)
+        )
+
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self):
         """Run one replay-buffer update epoch for DAgger."""
@@ -125,9 +149,22 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             self.cfg.actor.global_batch_size // self._world_size
         )
         with self.worker_timer("sample"):
-            global_batch = self.replay_buffer.sample(
-                num_chunks=global_batch_size_per_rank
-            )
+            if (
+                self._dagger_sft_align_offline()
+                and SupportedModel(self.cfg.actor.model.model_type)
+                == SupportedModel.DREAMZERO
+            ):
+                raw_batch = self.replay_buffer.sample_offline_sft_raw(
+                    global_batch_size_per_rank,
+                    self.model.make_offline_sft_sample_builder(),
+                )
+                global_batch = self.model.collate_offline_sft_dagger_batch(
+                    raw_batch["_offline_sft_raw_samples"]
+                )
+            else:
+                global_batch = self.replay_buffer.sample(
+                    num_chunks=global_batch_size_per_rank
+                )
 
         train_micro_batch_list = split_dict_to_chunk(
             global_batch,
@@ -135,6 +172,9 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         )
         for idx, batch in enumerate(train_micro_batch_list):
             batch = put_tensor_device(batch, device=self.device)
+            if self._is_offline_sft_collated_batch(batch):
+                train_micro_batch_list[idx] = batch
+                continue
             if self.enable_drq:
                 drq.apply_drq(batch["curr_obs"], pad=4)
                 drq.apply_drq(batch["next_obs"], pad=4)
@@ -142,13 +182,21 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
 
         self.optimizer.zero_grad()
         gbs_actor_loss = []
+        gbs_dynamics_loss = []
+        gbs_action_loss = []
         for mb_idx, batch in enumerate(train_micro_batch_list):
             backward_ctx = self.before_micro_batch(
                 self.model,
                 is_last_micro_batch=(mb_idx + 1) == self.gradient_accumulation,
             )
             with self.amp_context:
-                actor_loss = self.forward_actor(batch)
+                output = self.forward_actor(batch)
+            if isinstance(output, dict):
+                actor_loss = output["loss"]
+                gbs_dynamics_loss.append(output["dynamics_loss"].detach().item())
+                gbs_action_loss.append(output["action_loss"].detach().item())
+            else:
+                actor_loss = output
             actor_loss = actor_loss / self.gradient_accumulation
             with backward_ctx:
                 self.grad_scaler.scale(actor_loss).backward()
@@ -160,11 +208,16 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         self.optimizer.step()
         self.lr_scheduler.step()
 
-        return {
+        metrics = {
             "dagger/actor_loss": np.mean(gbs_actor_loss),
             "actor/lr": self.optimizer.param_groups[0]["lr"],
             "actor/grad_norm": actor_grad_norm,
         }
+        if gbs_dynamics_loss:
+            metrics["dagger/dynamics_loss"] = np.mean(gbs_dynamics_loss)
+        if gbs_action_loss:
+            metrics["dagger/action_loss"] = np.mean(gbs_action_loss)
+        return metrics
 
     def process_train_metrics(self, metrics):
         """Aggregate DAgger training and replay-buffer metrics."""
