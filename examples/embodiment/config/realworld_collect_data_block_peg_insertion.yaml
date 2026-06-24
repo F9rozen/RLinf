@@ -1,0 +1,68 @@
+defaults:
+  - env/realworld_block_peg_insertion@env.eval
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: franka
+      placement: 0
+  node_groups:
+    - label: franka
+      node_ranks: 0
+      hardware:
+        type: Franka
+        configs:
+          - robot_ip: 172.16.0.2
+            node_rank: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: "collect-block-peg-insertion"
+    logger_backends: ["tensorboard"] # wandb, swanlab
+  num_data_episodes: 100
+  record_task_description: False
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    ignore_terminations: False
+    auto_reset: False
+    use_spacemouse: True
+    no_gripper: False  # enable gripper channel so spacemouse can open/close
+    max_episode_steps: 10000
+    override_cfg:
+      clip_x_range: 0.5
+      clip_y_range: 0.5
+      clip_z_range_high: 0.25
+      # Optional per-camera overrides keyed by RealSense serial number.
+      # camera_names:
+      #   "SERIAL1": global
+      #   "SERIAL2": wrist_1
+      # camera_crop_regions:
+      #   "SERIAL1": [0.4, 0.3, 0.85, 0.7]
+      #task_description: "pick up the block and insert it into the hole"
+      # Insertion (hole) pose: edit to match the actual hole pose on the table.
+      target_ee_pose: [ 5.67969859e-01 , 4.75417939e-04 , 7.68111944e-02 , -3.10144613e+00,2.00938344e-02 ,-5.26217625e-03]
+
+      success_hold_steps: 1  # consecutive steps the robot must hold the inserted pose to succeed
+      enable_camera_player: False
+
+    data_collection:
+      enabled: True
+      save_dir: ${runner.logger.log_path}/collected_data
+      export_format: "lerobot"      # or "pickle"
+      only_success: True
+      robot_type: "panda"
+      fps: 10

@@ -6,9 +6,11 @@ export EVALUATIONS_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_PATH="$(dirname "$EVALUATIONS_PATH")"
 export EMBODIED_PATH="${REPO_PATH}/examples/embodiment"
 export SRC_FILE="${EVALUATIONS_PATH}/eval_embodied_agent.py"
-
+export DREAMZERO_PATH="${DREAMZERO_PATH:-/path/to/DreamZero}"
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
+export PYTHONPATH="${DREAMZERO_PATH}:${PYTHONPATH}"
 export HYDRA_FULL_ERROR=1
+export RLINF_CODE_WORKING_DIR=auto
 
 setup_sim_env() {
     export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
